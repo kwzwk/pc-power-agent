@@ -8,6 +8,7 @@ the script or .exe; a template is written on first run.
 import ctypes
 import json
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import psutil
+import pystray
+from PIL import Image, ImageDraw
 
 if sys.platform == "win32":
     import winreg
@@ -250,6 +253,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         log.error("MQTT connect failed: %s", reason_code)
         return
     log.info("Connected to MQTT")
+    set_tray_state("connected")
     client.subscribe([(COMMAND_TOPIC, 0), (HA_STATUS_TOPIC, 0)])
     publish_discovery(client)
     client.publish(STATUS_TOPIC, "online", retain=True)
@@ -264,6 +268,8 @@ def on_message(client, userdata, msg):
             client.publish(STATUS_TOPIC, "online", retain=True)
             userdata.reset()
         return
+    if msg.topic != COMMAND_TOPIC:
+        return
     action = ACTIONS.get(payload)
     if action is None:
         log.warning("Ignoring unknown command %r", payload)
@@ -274,28 +280,111 @@ def on_message(client, userdata, msg):
     threading.Timer(1.0, action).start()
 
 
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    log.info("Disconnected from MQTT: %s", reason_code)
+    set_tray_state("connecting" if agent.running else "stopped")
+
+
+class Agent:
+    """Owns the MQTT connection so the tray can start and stop it."""
+
+    def __init__(self):
+        self.running = False
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"pc_power_{SLUG}")
+        if CFG.get("username"):
+            self.client.username_pw_set(CFG["username"], CFG.get("password"))
+        self.client.will_set(STATUS_TOPIC, "offline", retain=True)
+        self.client.on_connect = on_connect
+        self.client.on_disconnect = on_disconnect
+        self.client.on_message = on_message
+        self.client.reconnect_delay_set(min_delay=2, max_delay=30)
+        poller = Poller(self.client)
+        self.client.user_data_set(poller)
+        threading.Thread(target=poller.run, daemon=True).start()
+
+    def start(self):
+        if self.running:
+            return
+        log.info("Starting")
+        self.running = True
+        set_tray_state("connecting")
+        # The loop thread keeps retrying until the broker is reachable and
+        # reconnects on its own after sleep or network drops.
+        self.client.connect_async(CFG["host"], int(CFG.get("port", 1883)), keepalive=30)
+        self.client.loop_start()
+
+    def stop(self):
+        if not self.running:
+            return
+        log.info("Stopping")
+        self.running = False
+        if self.client.is_connected():
+            # A clean disconnect skips the last will, so say offline ourselves.
+            self.client.publish(STATUS_TOPIC, "offline", retain=True).wait_for_publish(timeout=3)
+        self.client.disconnect()
+        self.client.loop_stop()
+        set_tray_state("stopped")
+
+
+# Tray icon: a monitor whose screen shows the connection state.
+TRAY_COLORS = {"connected": "#2e9d48", "connecting": "#e0a020", "stopped": "#8a8a8a"}
+TRAY_TEXT = {"connected": "Connected", "connecting": "Connecting…", "stopped": "Stopped"}
+tray = None
+tray_state = "stopped"
+agent = None
+
+
+def tray_image(state):
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((4, 8, 60, 46), radius=6, fill="#303030")
+    d.rounded_rectangle((9, 13, 55, 41), radius=3, fill=TRAY_COLORS[state])
+    d.rectangle((28, 46, 36, 54), fill="#303030")
+    d.rounded_rectangle((16, 52, 48, 58), radius=3, fill="#303030")
+    return img
+
+
+def set_tray_state(state):
+    global tray_state
+    tray_state = state
+    if tray is not None:
+        tray.icon = tray_image(state)
+        tray.title = f"PC power agent ({NAME}): {TRAY_TEXT[state]}"
+        tray.update_menu()
+
+
+def run_tray():
+    global tray
+
+    def open_folder(icon, item):
+        os.startfile(HERE)
+
+    def exit_app(icon, item):
+        agent.stop()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem(lambda item: f"{NAME}: {TRAY_TEXT[tray_state]}", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Start", lambda icon, item: agent.start(), enabled=lambda item: not agent.running),
+        pystray.MenuItem("Stop", lambda icon, item: agent.stop(), enabled=lambda item: agent.running),
+        pystray.MenuItem("Open folder", open_folder),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", exit_app),
+    )
+    tray = pystray.Icon("pc_power", tray_image(tray_state), "PC power agent", menu)
+    # setup runs once the icon is visible; start the agent from there.
+    tray.run(setup=lambda icon: (setattr(icon, "visible", True), agent.start()))
+
+
 def main():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"pc_power_{SLUG}")
-    if CFG.get("username"):
-        client.username_pw_set(CFG["username"], CFG.get("password"))
-    client.will_set(STATUS_TOPIC, "offline", retain=True)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.reconnect_delay_set(min_delay=2, max_delay=30)
-    poller = Poller(client)
-    client.user_data_set(poller)
-    threading.Thread(target=poller.run, daemon=True).start()
-
-    while True:
-        try:
-            client.connect(CFG["host"], int(CFG.get("port", 1883)), keepalive=30)
-            break
-        except OSError as err:  # network not up yet after boot or wake
-            log.warning("Broker not reachable (%s), retrying", err)
-            time.sleep(10)
-
-    # Reconnects on its own after sleep or network drops.
-    client.loop_forever(retry_first_connection=True)
+    global agent
+    agent = Agent()
+    if "--no-tray" in sys.argv:
+        agent.start()
+        while True:
+            time.sleep(3600)
+    run_tray()
 
 
 if __name__ == "__main__":

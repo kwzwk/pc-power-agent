@@ -14,7 +14,15 @@ device with three entities:
   app is using the webcam or microphone (read from Windows' privacy usage records)
 - `sensor.<name>_mac_address`: the MAC of the network adapter, for setting up Wake-on-LAN
 
-There's no window and no tray icon. It writes a log to `pc_power.log` next to the exe.
+It runs as a small icon in the taskbar's notification area. The screen of the monitor icon shows
+the state: green means connected, orange means connecting, grey means stopped. Right-click it for:
+
+- **Start** / **Stop**: connect to or disconnect from Home Assistant. While stopped, the buttons
+  show as unavailable in Home Assistant.
+- **Open folder**: opens the folder with `config.json` and the log `pc_power.log`.
+- **Exit**: stops the agent and closes it.
+
+Run it with `--no-tray` to run it without the icon.
 
 ## Install
 
@@ -35,7 +43,7 @@ There's no window and no tray icon. It writes a log to `pc_power.log` next to th
    schtasks /create /tn "PC power agent" /sc onlogon /rl limited /tr "C:\pc-power\pc_power.exe"
    ```
 
-To stop it, end `pc_power.exe` in Task Manager. To remove the logon task, run
+To stop it, use **Exit** in the tray menu. To remove the logon task, run
 `schtasks /delete /tn "PC power agent" /f`.
 
 Windows SmartScreen may warn the first time because the exe isn't signed. Click

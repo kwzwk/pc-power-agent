@@ -26,7 +26,7 @@ jobs:
         shell: pwsh
         run: |
           '{"host": "8.8.8.8"}' | Out-File -Encoding utf8NoBOM config.json
-          python -c "import pc_power as p; print(p.read_sensors(), p.local_mac(), round(p.idle_seconds()))"
+          python -c "import pc_power as p; print(p.read_sensors(), p.local_mac(), round(p.idle_seconds()), p.tray_image('connected').size)"
           Remove-Item config.json, pc_power.log -ErrorAction SilentlyContinue
 
       - name: Build
