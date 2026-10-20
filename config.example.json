@@ -1,0 +1,9 @@
+{
+  "host": "192.168.1.10",
+  "port": 1883,
+  "username": "mqtt-user",
+  "password": "change-me",
+  "device_name": "ZPC",
+  "discovery_prefix": "homeassistant",
+  "shutdown_delay_seconds": 0
+}

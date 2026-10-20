@@ -1,0 +1,55 @@
+# pc-power-agent
+
+A tiny Windows background app that lets Home Assistant put the PC to **sleep** or **shut it down**.
+
+It connects to your MQTT broker (for example the Mosquitto add-on) and uses MQTT discovery to add a
+device with three entities:
+
+- `button.<name>_sleep`: puts the PC to sleep
+- `button.<name>_shut_down`: normal Windows shutdown (apps are asked to close, nothing is forced)
+- `binary_sensor.<name>_online`: on while the PC is running and connected
+
+There's no window and no tray icon. It writes a log to `pc_power.log` next to the exe.
+
+## Install
+
+1. Download `pc_power.exe` from the latest [release](../../releases/latest) and put it in a
+   folder such as `C:\pc-power`.
+2. Double-click it once. It writes a `config.json` template next to itself and exits.
+3. Edit `config.json`:
+   - `host`: your Home Assistant / MQTT broker IP address
+   - `username` / `password`: your MQTT login
+   - `device_name`: the name shown in Home Assistant (defaults to the PC name)
+   - `shutdown_delay_seconds`: 0 shuts down right away. Something like 30 gives you time to cancel with `shutdown /a`.
+4. Double-click it again. The device should show up in Home Assistant under
+   Settings > Devices > MQTT within a few seconds.
+5. Make it start at logon. Run this once in a terminal:
+
+   ```
+   schtasks /create /tn "PC power agent" /sc onlogon /rl limited /tr "C:\pc-power\pc_power.exe"
+   ```
+
+To stop it, end `pc_power.exe` in Task Manager. To remove the logon task, run
+`schtasks /delete /tn "PC power agent" /f`.
+
+Windows SmartScreen may warn the first time because the exe isn't signed. Click
+**More info**, then **Run anyway**.
+
+## Notes
+
+- **Sleep turns into hibernate:** if hibernation is on, Windows may hibernate instead of
+  sleeping. Run `powercfg /h off` as admin to always get a real sleep.
+- **Waking the PC:** this agent can't wake the PC. That needs Wake-on-LAN.
+- **Who can control it:** anyone who can publish to `pc_power/<name>/command` can sleep or shut
+  down the PC, so keep your broker password-protected.
+- **Topics:** commands go to `pc_power/<name>/command` (`sleep` or `shutdown`) and status goes to
+  `pc_power/<name>/status` (`online`/`offline`, retained, with a last-will message).
+
+## Build it yourself
+
+```
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --noconsole --name pc_power pc_power.py
+```
+
+GitHub Actions builds the exe on every push. Pushing a `v*` tag publishes a release.
