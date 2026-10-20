@@ -22,6 +22,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller==6.11.1
 
+      - name: Check Windows sensors
+        shell: pwsh
+        run: |
+          '{"host": "8.8.8.8"}' | Out-File -Encoding utf8NoBOM config.json
+          python -c "import pc_power as p; print(p.read_sensors(), p.local_mac(), round(p.idle_seconds()))"
+          Remove-Item config.json, pc_power.log -ErrorAction SilentlyContinue
+
       - name: Build
         run: pyinstaller --onefile --noconsole --name pc_power pc_power.py
 

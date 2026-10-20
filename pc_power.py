@@ -16,6 +16,10 @@ import time
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
+import psutil
+
+if sys.platform == "win32":
+    import winreg
 
 # Next to the .exe when built with PyInstaller, next to the script otherwise.
 if getattr(sys, "frozen", False):
@@ -31,6 +35,7 @@ DEFAULT_CONFIG = {
     "device_name": socket.gethostname(),
     "discovery_prefix": "homeassistant",
     "shutdown_delay_seconds": 0,
+    "idle_after_seconds": 300,
 }
 if not CONFIG_PATH.exists():
     # First run: write a template to fill in, then stop.
@@ -45,6 +50,8 @@ BASE = f"pc_power/{SLUG}"
 STATUS_TOPIC = f"{BASE}/status"
 COMMAND_TOPIC = f"{BASE}/command"
 HA_STATUS_TOPIC = f"{PREFIX}/status"
+POLL_SECONDS = 5
+IDLE_AFTER = int(CFG.get("idle_after_seconds", 300))
 
 logging.basicConfig(
     filename=HERE / "pc_power.log",
@@ -91,6 +98,135 @@ def publish_discovery(client):
         "device": device,
     }
     client.publish(f"{PREFIX}/binary_sensor/{SLUG}/online/config", json.dumps(status), retain=True)
+    for key, (label, icon, device_class) in SENSORS.items():
+        config = {
+            "name": label,
+            "unique_id": f"pc_power_{SLUG}_{key}",
+            "state_topic": f"{BASE}/{key}",
+            "icon": icon,
+            "availability": [availability],
+            "device": device,
+        }
+        if device_class:
+            config["device_class"] = device_class
+        client.publish(f"{PREFIX}/binary_sensor/{SLUG}/{key}/config", json.dumps(config), retain=True)
+    mac = {
+        "name": "MAC address",
+        "unique_id": f"pc_power_{SLUG}_mac",
+        "state_topic": f"{BASE}/mac",
+        "icon": "mdi:ethernet",
+        "entity_category": "diagnostic",
+        "device": device,
+    }
+    client.publish(f"{PREFIX}/sensor/{SLUG}/mac/config", json.dumps(mac), retain=True)
+
+
+# Binary sensors polled from Windows: key -> (name, icon, device_class).
+SENSORS = {
+    "active": ("Active", "mdi:account-check", "occupancy"),
+    "camera": ("Camera in use", "mdi:webcam", None),
+    "microphone": ("Microphone in use", "mdi:microphone", None),
+}
+
+
+def idle_seconds():
+    """Seconds since the last keyboard or mouse input."""
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+    # Both are 32-bit millisecond tick counts, so wraparound cancels out.
+    now = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+    return ((now - info.dwTime) & 0xFFFFFFFF) / 1000
+
+
+def device_in_use(capability):
+    """True if any app is using the webcam/microphone right now.
+
+    Windows records LastUsedTimeStop = 0 for an app while it holds the device.
+    """
+    root = rf"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\{capability}"
+
+    def scan(path):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, path)
+        except OSError:
+            return False
+        with key:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(key, i)
+                except OSError:
+                    return False
+                i += 1
+                if name == "NonPackaged":
+                    if scan(rf"{path}\{name}"):
+                        return True
+                    continue
+                try:
+                    with winreg.OpenKey(key, name) as app:
+                        stop, _ = winreg.QueryValueEx(app, "LastUsedTimeStop")
+                        start, _ = winreg.QueryValueEx(app, "LastUsedTimeStart")
+                except OSError:
+                    continue
+                if stop == 0 and start > 0:
+                    return True
+
+    return scan(root)
+
+
+def local_mac():
+    """MAC of the network adapter that reaches the MQTT broker (for Wake-on-LAN)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((CFG["host"], int(CFG.get("port", 1883))))
+        ip = s.getsockname()[0]
+    for addrs in psutil.net_if_addrs().values():
+        if any(a.family == socket.AF_INET and a.address == ip for a in addrs):
+            for a in addrs:
+                if a.family == psutil.AF_LINK:
+                    mac = a.address.replace("-", ":").upper()
+                    return None if mac == "00:00:00:00:00:00" else mac
+    return None
+
+
+def read_sensors():
+    return {
+        "active": idle_seconds() < IDLE_AFTER,
+        "camera": device_in_use("webcam"),
+        "microphone": device_in_use("microphone"),
+    }
+
+
+class Poller:
+    """Publishes sensor states every few seconds, but only when they change."""
+
+    def __init__(self, client):
+        self.client = client
+        self.last = {}
+
+    def reset(self):
+        self.last = {}  # republish everything after a (re)connect
+
+    def run(self):
+        while True:
+            if self.client.is_connected():
+                try:
+                    states = read_sensors()
+                    if "mac" not in self.last:
+                        states["mac"] = local_mac()
+                except Exception:
+                    log.exception("Reading sensors failed")
+                    states = {}
+                for key, value in states.items():
+                    if value is None or self.last.get(key) == value:
+                        continue
+                    payload = value if key == "mac" else ("ON" if value else "OFF")
+                    self.client.publish(f"{BASE}/{key}", payload, retain=True)
+                    self.last[key] = value
+            time.sleep(POLL_SECONDS)
 
 
 def do_sleep():
@@ -117,6 +253,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
     client.subscribe([(COMMAND_TOPIC, 0), (HA_STATUS_TOPIC, 0)])
     publish_discovery(client)
     client.publish(STATUS_TOPIC, "online", retain=True)
+    userdata.reset()
 
 
 def on_message(client, userdata, msg):
@@ -125,6 +262,7 @@ def on_message(client, userdata, msg):
         if payload == "online":  # HA restarted, re-announce ourselves
             publish_discovery(client)
             client.publish(STATUS_TOPIC, "online", retain=True)
+            userdata.reset()
         return
     action = ACTIONS.get(payload)
     if action is None:
@@ -144,6 +282,9 @@ def main():
     client.on_connect = on_connect
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=2, max_delay=30)
+    poller = Poller(client)
+    client.user_data_set(poller)
+    threading.Thread(target=poller.run, daemon=True).start()
 
     while True:
         try:
