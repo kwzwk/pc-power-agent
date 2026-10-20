@@ -52,4 +52,4 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --onefile --noconsole --name pc_power pc_power.py
 ```
 
-GitHub Actions builds the exe on every push. Pushing a `v*` tag publishes a release.
+GitHub Actions builds the exe on every push. Every push to `main` also publishes it as a new release.
